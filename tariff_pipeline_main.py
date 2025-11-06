@@ -7,7 +7,7 @@ if script_dir not in sys.path:
     sys.path.insert(0, script_dir)
 
 from Reach_EnergiDataService import fetch_datahub_pricelist
-from categorize_tariffs import enhanced_categorize_tariff_data
+from categorize_tariffs import categorize_tariff_data
 
 # ============================================================
 # CONFIGURATION - Change these settings as needed
@@ -15,10 +15,10 @@ from categorize_tariffs import enhanced_categorize_tariff_data
 
 START_DATE = '2021-01-01'  # Start date (YYYY-MM-DD)
 END_DATE = '2024-12-31'    # End date (YYYY-MM-DD)
-USE_CACHED = False          # Set to False to force fresh download from API
+USE_CACHED = True          # Set to False to force fresh download from API
 
 RAW_DATA_FILENAME = 'Tarif_data_2021_2024'           # Base filename for raw data
-OUTPUT_FILENAME = 'tariff_categorization_results.xlsx'  # Final Excel output
+OUTPUT_FILENAME = 'tariff_categorization_results5.xlsx'  # Final Excel output
 
 # ============================================================
 
@@ -59,44 +59,13 @@ def main():
     
     csv_path = os.path.join(data_dir, f'{RAW_DATA_FILENAME}.csv')
     
-    result = enhanced_categorize_tariff_data(
-        file_path=csv_path,
-        output_filename=OUTPUT_FILENAME,
+    result = categorize_tariff_data(
+        input_file=csv_path,
+        output_file=OUTPUT_FILENAME,
         use_data_folder=True
     )
     
-    if 'error' in result:
-        print(f"❌ Categorization failed: {result['error']}")
-        return
-    
-    # Summary
-    print("\n" + "="*70)
-    print("PIPELINE COMPLETED SUCCESSFULLY! 🎉")
-    print("="*70)
-    
-    df_categorized = result['df']
-    
-    print(f"\n📊 FINAL RESULTS:")
-    print(f"   Total rows processed: {len(df_categorized)}")
-    print(f"   Output file: {result['output_path']}")
-    
-    print(f"\n📈 CATEGORIZATION SUMMARY:")
-    print(f"   Kundetype categories: {df_categorized['Kundetype'].nunique()}")
-    print(f"   Tariftype categories: {df_categorized['Tariftype'].nunique()}")
-    
-    uncategorized_both = len(df_categorized[
-        (df_categorized['Kundetype'] == 'Uncategorized') & 
-        (df_categorized['Tariftype'] == 'Uncategorized')
-    ])
-    print(f"   Fully uncategorized: {uncategorized_both} ({(uncategorized_both/len(df_categorized)*100):.2f}%)")
-    
-    print(f"\n📁 FILES CREATED:")
-    print(f"   Raw data (CSV): {csv_path}")
-    print(f"   Raw data (Parquet): {csv_path.replace('.csv', '.parquet')}")
-    print(f"   Categorized results: {result['output_path']}")
-    
-    print("\n" + "="*70)
-    print("✅ All done! Check the Data folder for your results.")
+
 
 
 if __name__ == "__main__":

@@ -1,422 +1,351 @@
 import pandas as pd
-import numpy as np
+import polars as pl
 import os
-import re
-from collections import Counter
-from datetime import datetime
 
-# Enhanced categorization patterns based on actual data analysis
-kundetype_patterns = {
-    'Ahøj': [
-        'a høj', 'a-høj', 'a0', 'net abo a høj', 'nettarif a høj',
-        '30-60 kv', 'a0 forbrug', 'e-59', 'e-78', 'e-87'
-    ],
-    'Alav': [
-        'a lav', 'a-lav', 'net abo a lav', 'nettarif a lav',
-        '10-20 kv-siden af en hovedstation', 'e-58', 'e-83', 'e-86'
-    ],
-    'Bhøj': [
-        'b høj', 'b-høj', 'net abo b høj', 'nettarif b høj',
-        '10-20 kv', 'e-56', 'e-68', 'e-72', 'e-82'
-    ],
-    'Blav': [
-        'b lav', 'b-lav', 'net abo b lav', 'nettarif b lav',
-        '0,4 kv-siden af en 10-20', 'e-54', 'e-67', 'e-71', 'e-81'
-    ],
-    'C': [
-        'net abo c', 'nettarif c', 'type c', ' c ', 'kunde c', 'kategori c',
-        '0,4 kv-nettet', '0.4 kv', '0,4 kv', 'årsaflæst måler',
-        'e-50', 'e-51', 'e-66', 'e-70', 'e-80', 'e-85'
-    ]
-}
+# Import configuration
+from categorization_config import (
+    kundetype_patterns,
+    tariftype_patterns,
+    chargetype_mapping,
+    kundetype_priority,
+    tariftype_priority,
+    OUTPUT_COLUMN_ORDER,
+    GRID_MAPPING_FILENAME,
+    DEFAULT_OUTPUT_FILENAME
+)
 
-tariftype_patterns = {
-    'tidsdifferentieret': [
-        'tidsdifferentieret', 'tids-differentieret', 'tid differentieret',
-        'time of use', 'tou', 'timeaflæst', 'time', 'nettarif'
-    ],
-    'abonnement': [
-        'abonnement', 'abo', 'net abo', 'subscription', 'fast betaling'
-    ],
-    'rådighed': [
-        'rådighed', 'availability', 'kapacitet', 'rådighedstarif'
-    ],
-    'indfødning': [
-        'indfødning', 'feed-in', 'produktion', 'producent', 'vindmølle',
-        'egenprod', 'produktion', 'prod'
-    ],
-    'effektbetaling': [
-        'effektbetaling', 'effekt', 'capacity charge', 'demand charge'
-    ]
-}
-
-def get_script_directory():
-    """Get the directory where the script is located"""
-    return os.path.dirname(os.path.abspath(__file__))
+# ============================================
+# DIRECTORY HELPERS
+# ============================================
 
 def get_data_directory():
-    """Get the Data directory parallel to the script directory"""
-    script_dir = get_script_directory()
+    """Get Data directory parallel to script directory"""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(os.path.dirname(script_dir), 'Data')
 
-def ensure_data_directory():
-    """Ensure the Data directory exists"""
+# ============================================
+# GRID COMPANY MAPPING
+# ============================================
+
+def load_grid_mapping():
+    """Load grid company mapping file"""
     data_dir = get_data_directory()
-    os.makedirs(data_dir, exist_ok=True)
-    return data_dir
+    mapping_file = os.path.join(data_dir, GRID_MAPPING_FILENAME)
+    
+    if not os.path.exists(mapping_file):
+        print(f"⚠️  Grid mapping file not found: {GRID_MAPPING_FILENAME}")
+        return None
+    
+    df_mapping = pd.read_excel(mapping_file)
+    mapping = {}
+    for _, row in df_mapping.iterrows():
+        company_name = str(row['GRID_COMPANY_NAME']).strip()
+        if company_name not in mapping:
+            mapping[company_name] = {
+                'MPO_GRID_AREA_CODE': row['MPO_GRID_AREA_CODE'],
+                'PriceArea': row['PriceArea']
+            }
+    print(f"✅ Loaded {len(mapping)} grid companies")
+    return mapping
 
-def find_category(row, category_patterns, priority_columns=['ChargeTypeCode', 'Note', 'Description', 'ChargeType']):
+def map_grid_codes(df, grid_mapping):
+    """Map ChargeOwner to MPO_GRID_AREA_CODE and PriceArea"""
+    if grid_mapping is None or 'ChargeOwner' not in df.columns:
+        return df
+    
+    df['MPO_GRID_AREA_CODE'] = None
+    df['PriceArea'] = None
+    
+    for idx, row in df.iterrows():
+        if pd.notna(row.get('ChargeOwner')):
+            owner = str(row['ChargeOwner']).strip()
+            if owner in grid_mapping:
+                df.at[idx, 'MPO_GRID_AREA_CODE'] = grid_mapping[owner]['MPO_GRID_AREA_CODE']
+                df.at[idx, 'PriceArea'] = grid_mapping[owner]['PriceArea']
+    
+    return df
+
+# ============================================
+# CATEGORIZATION FUNCTIONS
+# ============================================
+
+def categorize_chargetype(charge_type):
+    """Map D01/D02/D03 to category"""
+    if pd.notna(charge_type):
+        return chargetype_mapping.get(str(charge_type).strip().upper(), 'Unknown')
+    return 'Unknown'
+
+def find_category2(row, category_patterns):
     """
-    Find which category a row belongs to based on pattern matching.
-    Checks multiple columns in order of priority for better accuracy.
+    Find which category a row belongs to using cascading filter approach.
+    
+    Algorithm:
+    1. Start with all possible categories
+    2. Check ChargeType - keep only categories that match (or have no patterns)
+    3. If multiple remain, check ChargeTypeCode - narrow down further
+    4. If multiple remain, check Note - narrow down further
+    5. If multiple remain, check Description - narrow down further
+    6. If exactly one category remains, return it. Otherwise "Uncategorized"
+    
+    Args:
+        row: DataFrame row to categorize
+        category_patterns: Dictionary with structure {category: {column: [patterns]}}
+    
+    Returns:
+        Category name or "Uncategorized"
     """
-    for category, patterns in category_patterns.items():
-        for col in priority_columns:
-            if col in row and pd.notna(row[col]):
-                text_lower = str(row[col]).lower()
-                for pattern in patterns:
-                    if pattern in text_lower:
-                        return category
+    # Get column priority order from config
+    column_priority = COLUMN_PRIORITY_ORDER
     
-    return "Uncategorized"
+    # Start with all categories as candidates
+    candidate_categories = list(category_patterns.keys())
+    
+    # Process each column in priority order
+    for column in column_priority:
+        # Skip if column doesn't exist in row or is empty
+        if column not in row or pd.notna(row[column]) is False:
+            continue
+        
+        text_lower = str(row[column]).lower()
+        
+        # Find which candidates match at this priority level
+        matching_categories = []
+        categories_with_patterns = []
+        
+        for category in candidate_categories:
+            # Check if this category has patterns for this column
+            if column not in category_patterns[category]:
+                continue
+            
+            patterns = category_patterns[category][column]
+            
+            # If category has no patterns for this column, keep it as candidate
+            if not patterns:
+                continue
+            
+            # This category has patterns for this column
+            categories_with_patterns.append(category)
+            
+            # Check if any pattern matches
+            for pattern in patterns:
+                if pattern.lower() in text_lower:
+                    matching_categories.append(category)
+                    break  # Found a match, no need to check other patterns
+        
+        # If some categories had patterns for this column, filter based on matches
+        if categories_with_patterns:
+            if matching_categories:
+                # Narrow down to only matching categories
+                candidate_categories = matching_categories
+            else:
+                # No matches found, but some had patterns - these are eliminated
+                # Keep only categories that didn't have patterns for this column
+                candidate_categories = [c for c in candidate_categories if c not in categories_with_patterns]
+        
+        # If we're down to one candidate, we're done
+        if len(candidate_categories) == 1:
+            return candidate_categories[0]
+        
+        # If we're down to zero candidates, return uncategorized
+        if len(candidate_categories) == 0:
+            return "Uncategorized"
+    
+    # After checking all columns:
+    # - If exactly one category remains, return it
+    # - If multiple remain, it's ambiguous -> Uncategorized
+    # - If none remain, return Uncategorized
+    if len(candidate_categories) == 1:
+        return candidate_categories[0]
+    else:
+        return "Uncategorized"
 
-def enhanced_categorize_tariff_data(
-    file_path, 
-    output_filename=None,
-    use_data_folder=True
-):
+def find_category(row, category_patterns,COLUMN_PRIORITY_ORDER):
     """
-    Enhanced categorization of tariff data with improved pattern matching
+    Cascading filter: Start with all categories, narrow down at each priority level.
+    
+    Rules:
+    1. If column is empty/missing in data → skip to next column (don't check patterns)
+    2. If column has data AND category has empty pattern list [] → category abstains (stays)
+    3. If column has data AND category has patterns:
+       - Pattern matches → keep category
+       - Pattern doesn't match → eliminate category
+    
+    Args:
+        row: DataFrame row to categorize
+        category_patterns: {category: {column: [patterns]}}
+    
+    Returns:
+        Category name or "Uncategorized"
     """
-    try:
-        # Determine output directory
-        if use_data_folder:
-            output_dir = ensure_data_directory()
-        else:
-            output_dir = os.path.dirname(file_path)
+    candidates = list(category_patterns.keys())
+    #print()
+    #print(row[COLUMN_PRIORITY_ORDER])
+    #print(candidates)
+    #print(COLUMN_PRIORITY_ORDER)
+    for c, column in enumerate(COLUMN_PRIORITY_ORDER):
+        # Skip if column doesn't exist, is NaN, or is empty string
+        if column not in row or pd.isna(row[column]) or str(row[column]).strip() == '':
+            continue
         
-        if output_filename is None:
-            base_name = os.path.splitext(os.path.basename(file_path))[0]
-            output_filename = f"{base_name}_categorized.xlsx"
+        text = str(row[column]).lower()
+        new_candidates = []
         
-        output_path = os.path.join(output_dir, output_filename)
-        
-        # Read the CSV file
-        print(f"Reading data from: {file_path}")
-        df = pd.read_csv(file_path, encoding='utf-8')
-        
-        print(f"Successfully read {len(df)} rows from CSV")
-        print(f"Columns found: {df.columns.tolist()}")
-        
-        # Verify required columns exist
-        required_columns = ['ChargeType', 'ChargeTypeCode', 'Note', 'Description']
-        missing_columns = [col for col in required_columns if col not in df.columns]
-        
-        if missing_columns:
-            print(f"Warning: Missing columns: {missing_columns}")
-        
-        # Convert text columns to string and handle NaN values
-        for col in required_columns:
-            if col in df.columns:
-                df[col] = df[col].astype(str).replace('nan', '')
-        
-        # Apply categorization
-        print("Applying categorization...")
-        df['Kundetype'] = df.apply(
-            lambda row: find_category(row, kundetype_patterns), 
-            axis=1
-        )
-        df['Tariftype'] = df.apply(
-            lambda row: find_category(row, tariftype_patterns), 
-            axis=1
-        )
-        
-        # Generate comprehensive statistics
-        stats = generate_comprehensive_stats(df)
-        
-        # Create analysis sheets
-        analysis_data = create_analysis_sheets(df)
-        
-        # Save to Excel with multiple sheets
-        print(f"Saving results to: {output_path}")
-        with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-            # Main categorized data
-            df.to_excel(writer, sheet_name='Categorized Data', index=False)
-            
-            # Statistics sheet
-            stats_df = create_stats_dataframe(stats)
-            stats_df.to_excel(writer, sheet_name='Statistics', index=False)
-            
-            # Pattern analysis
-            analysis_data['pattern_matches'].to_excel(writer, sheet_name='Pattern Analysis', index=False)
-            
-            # Uncategorized entries
-            analysis_data['uncategorized'].to_excel(writer, sheet_name='Uncategorized', index=False)
-            
-            # Code mapping analysis
-            analysis_data['code_mapping'].to_excel(writer, sheet_name='Code Mapping', index=False)
-            
-            # Suggestions for improvement
-            if not analysis_data['suggestions'].empty:
-                analysis_data['suggestions'].to_excel(writer, sheet_name='Suggestions', index=False)
-        
-        print(f"Excel file saved successfully!")
-        print_comprehensive_stats(stats)
-        
-        return {
-            'df': df,
-            'stats': stats,
-            'output_path': output_path,
-            'analysis': analysis_data
-        }
-        
-    except Exception as e:
-        print(f"Error processing file: {e}")
-        import traceback
-        traceback.print_exc()
-        return {'error': str(e)}
+        for category in candidates:
 
-def generate_comprehensive_stats(df):
-    """Generate comprehensive statistics about the categorization"""
-    total_rows = len(df)
-    
-    # Basic categorization counts
-    kundetype_counts = df['Kundetype'].value_counts()
-    tariftype_counts = df['Tariftype'].value_counts()
-    
-    # Cross-tabulation
-    cross_tab = pd.crosstab(df['Kundetype'], df['Tariftype'], margins=True)
-    
-    # Uncategorized analysis
-    uncategorized_both = len(df[
-        (df['Kundetype'] == 'Uncategorized') & 
-        (df['Tariftype'] == 'Uncategorized')
-    ])
-    
-    # ChargeTypeCode mapping analysis
-    code_kundetype = df.groupby('ChargeTypeCode')['Kundetype'].agg(['count', lambda x: x.mode().iloc[0] if len(x.mode()) > 0 else 'Mixed'])
-    code_tariftype = df.groupby('ChargeTypeCode')['Tariftype'].agg(['count', lambda x: x.mode().iloc[0] if len(x.mode()) > 0 else 'Mixed'])
-    
-    return {
-        'total_rows': total_rows,
-        'kundetype_counts': kundetype_counts,
-        'tariftype_counts': tariftype_counts,
-        'cross_tab': cross_tab,
-        'uncategorized_both': uncategorized_both,
-        'code_kundetype': code_kundetype,
-        'code_tariftype': code_tariftype
-    }
+            # Get patterns for this category and column
+            if column not in category_patterns[category]:
+                new_candidates.append(category)
+                continue
+            
+            patterns = category_patterns[category][column]
+            
+            if not patterns:  # Empty list [] - category abstains
+                new_candidates.append(category)
+                continue
+            
+            # Category has patterns - check if any match
+            for pattern in patterns:
+                if pattern.lower() in text:
+                    new_candidates.append(category)
+                    break
+        # After
+        #if len(new_candidates) == 1:
+         #   break
 
-def create_analysis_sheets(df):
-    """Create detailed analysis sheets for the Excel output"""
-    
-    # Pattern matching analysis
-    pattern_analysis = []
-    for _, row in df.iterrows():
-        for category_type, patterns_dict in [('Kundetype', kundetype_patterns), ('Tariftype', tariftype_patterns)]:
-            category = row[category_type]
-            if category != 'Uncategorized':
-                # Find which pattern matched
-                matched_patterns = []
-                for col in ['ChargeTypeCode', 'Note', 'Description', 'ChargeType']:
-                    if col in row and pd.notna(row[col]):
-                        text_lower = str(row[col]).lower()
-                        for pattern in patterns_dict[category]:
-                            if pattern in text_lower:
-                                matched_patterns.append(f"{col}:'{pattern}'")
-                
-                pattern_analysis.append({
-                    'ChargeTypeCode': row['ChargeTypeCode'],
-                    'Note': row['Note'],
-                    'Category_Type': category_type,
-                    'Assigned_Category': category,
-                    'Matched_Patterns': '; '.join(matched_patterns[:3])  # Top 3 matches
-                })
-    
-    pattern_df = pd.DataFrame(pattern_analysis).drop_duplicates()
-    
-    # Uncategorized analysis
-    uncategorized = df[
-        (df['Kundetype'] == 'Uncategorized') | 
-        (df['Tariftype'] == 'Uncategorized')
-    ][['ChargeTypeCode', 'Note', 'Description', 'Kundetype', 'Tariftype']].drop_duplicates()
-    
-    # Code mapping analysis
-    code_mapping = []
-    for code in df['ChargeTypeCode'].unique():
-        code_data = df[df['ChargeTypeCode'] == code]
-        kundetype_mode = code_data['Kundetype'].mode()
-        tariftype_mode = code_data['Tariftype'].mode()
+        candidates = new_candidates
         
-        code_mapping.append({
-            'ChargeTypeCode': code,
-            'Count': len(code_data),
-            'Most_Common_Kundetype': kundetype_mode.iloc[0] if len(kundetype_mode) > 0 else 'N/A',
-            'Kundetype_Consistency': len(code_data['Kundetype'].unique()) == 1,
-            'Most_Common_Tariftype': tariftype_mode.iloc[0] if len(tariftype_mode) > 0 else 'N/A',
-            'Tariftype_Consistency': len(code_data['Tariftype'].unique()) == 1,
-            'Sample_Note': code_data['Note'].iloc[0] if len(code_data) > 0 else ''
-        })
-    
-    code_mapping_df = pd.DataFrame(code_mapping).sort_values('Count', ascending=False)
-    
-    # Suggestions for uncategorized items
-    suggestions = suggest_improvements(uncategorized)
-    
-    return {
-        'pattern_matches': pattern_df,
-        'uncategorized': uncategorized,
-        'code_mapping': code_mapping_df,
-        'suggestions': suggestions
-    }
+        # Early termination
+        if len(candidates) == 0:
+            type = "Uncategorized"
+            #print(type)
+            return type
+        if len(candidates) == 1:
+            type = candidates[0]
+            #print(type)
+            return type
+        
 
-def suggest_improvements(uncategorized_df):
-    """Suggest improvements for uncategorized items"""
-    suggestions = []
-    
-    for _, row in uncategorized_df.iterrows():
-        note = str(row['Note']).lower()
-        desc = str(row['Description']).lower()
-        code = str(row['ChargeTypeCode']).lower()
-        
-        suggestion = {
-            'ChargeTypeCode': row['ChargeTypeCode'],
-            'Note': row['Note'],
-            'Current_Kundetype': row['Kundetype'],
-            'Current_Tariftype': row['Tariftype'],
-            'Suggested_Kundetype': '',
-            'Suggested_Tariftype': '',
-            'Reasoning': ''
-        }
-        
-        # Kundetype suggestions
-        if any(x in note or x in desc for x in ['a', 'høj', 'lav']):
-            if 'a' in note and 'høj' in note:
-                suggestion['Suggested_Kundetype'] = 'Ahøj'
-                suggestion['Reasoning'] += 'Contains "a" and "høj"; '
-            elif 'a' in note and 'lav' in note:
-                suggestion['Suggested_Kundetype'] = 'Alav'
-                suggestion['Reasoning'] += 'Contains "a" and "lav"; '
-            elif 'b' in note and 'høj' in note:
-                suggestion['Suggested_Kundetype'] = 'Bhøj'
-                suggestion['Reasoning'] += 'Contains "b" and "høj"; '
-            elif 'b' in note and 'lav' in note:
-                suggestion['Suggested_Kundetype'] = 'Blav'
-                suggestion['Reasoning'] += 'Contains "b" and "lav"; '
-        
-        if 'c' in note or '0,4' in desc or '0.4' in desc:
-            suggestion['Suggested_Kundetype'] = 'C'
-            suggestion['Reasoning'] += 'Contains "c" or voltage indicators; '
-        
-        # Tariftype suggestions
-        if 'abo' in note or 'abonnement' in desc:
-            suggestion['Suggested_Tariftype'] = 'abonnement'
-            suggestion['Reasoning'] += 'Contains subscription terms; '
-        elif 'time' in note or 'timeaflæst' in desc:
-            suggestion['Suggested_Tariftype'] = 'tidsdifferentieret'
-            suggestion['Reasoning'] += 'Contains time-related terms; '
-        elif any(x in note or x in desc for x in ['producent', 'produktion', 'vindmølle']):
-            suggestion['Suggested_Tariftype'] = 'indfødning'
-            suggestion['Reasoning'] += 'Contains production terms; '
-        elif 'effekt' in note or 'effekt' in desc:
-            suggestion['Suggested_Tariftype'] = 'effektbetaling'
-            suggestion['Reasoning'] += 'Contains power/effect terms; '
-        
-        if suggestion['Suggested_Kundetype'] or suggestion['Suggested_Tariftype']:
-            suggestions.append(suggestion)
-    
-    return pd.DataFrame(suggestions)
+    c = len(COLUMN_PRIORITY_ORDER)
+    # After all columns
+    if len(candidates) == 0:
+        type = "Uncategorized"
+        #print(type)
+        return type
+    if len(candidates) == 1:
+        type = candidates[0]
+        #print(type)
+        return type
 
-def create_stats_dataframe(stats):
-    """Convert statistics to DataFrame format"""
-    rows = []
-    
-    # Overall stats
-    rows.append({'Category': 'Overall', 'Metric': 'Total Rows', 'Value': stats['total_rows']})
-    
-    # Kundetype distribution
-    for category, count in stats['kundetype_counts'].items():
-        percentage = (count / stats['total_rows']) * 100
-        rows.append({
-            'Category': 'Kundetype',
-            'Metric': category,
-            'Value': count,
-            'Percentage': f'{percentage:.2f}%'
-        })
-    
-    # Tariftype distribution
-    for category, count in stats['tariftype_counts'].items():
-        percentage = (count / stats['total_rows']) * 100
-        rows.append({
-            'Category': 'Tariftype',
-            'Metric': category,
-            'Value': count,
-            'Percentage': f'{percentage:.2f}%'
-        })
-    
-    return pd.DataFrame(rows)
+# ============================================
+# MAIN FUNCTION
+# ============================================
 
-def print_comprehensive_stats(stats):
-    """Print comprehensive statistics"""
-    print(f"\n{'='*50}")
-    print("CATEGORIZATION RESULTS SUMMARY")
-    print(f"{'='*50}")
+def load_raw_tarif_data(input_file, output_file=None, use_data_folder=True):
+    """
+    Main categorization function
+
+    Args:
+        input_file: Path to input CSV file
+        output_file: Output filename (default from config)
+        use_data_folder: If True, save to Data folder; if False, save to same dir as input
+    """
+
+    # Determine output directory
+    if use_data_folder:
+        output_dir = get_data_directory()
+        os.makedirs(output_dir, exist_ok=True)
+    else:
+        output_dir = os.path.dirname(input_file)
+
+    if output_file is None:
+        output_file = DEFAULT_OUTPUT_FILENAME
+
+    output_path = os.path.join(output_dir, output_file)
+
+    # Read data
+    print(f"Reading: {input_file}")
+    df = pd.read_csv(input_file, encoding='utf-8')
+    print(f"Loaded {len(df)} rows")
     
-    print(f"Total rows processed: {stats['total_rows']}")
+    # Convert date columns to datetime
+    df['ValidFrom'] = pd.to_datetime(df['ValidFrom'], errors='coerce')
+    df['ValidTo'] = pd.to_datetime(df['ValidTo'], errors='coerce')
     
-    print(f"\nKUNDETYPE DISTRIBUTION:")
-    for category, count in stats['kundetype_counts'].items():
-        percentage = (count / stats['total_rows']) * 100
-        print(f"  {category}: {count} ({percentage:.2f}%)")
+    # Remove duplicates and aggregate date ranges
+    # Group by all columns except valid_from and valid_to
+    date_cols = ['ValidFrom', 'ValidTo']
+    group_cols = [col for col in df.columns if col not in date_cols]
     
-    print(f"\nTARIFTYPE DISTRIBUTION:")
-    for category, count in stats['tariftype_counts'].items():
-        percentage = (count / stats['total_rows']) * 100
-        print(f"  {category}: {count} ({percentage:.2f}%)")
+    # Group and aggregate dates
+    df2 = df.groupby(group_cols, dropna=False).agg({
+        'ValidFrom': 'min',
+        'ValidTo': 'max'
+    }).reset_index()
     
-    print(f"\nCompletely uncategorized: {stats['uncategorized_both']} rows")
+    print(f"After deduplication: {len(df)} rows")
+
+    return df2,output_path
+
+def categorize_tariff_data(df):
+    """
+    Main categorization function
     
-    print(f"\nCROSS-TABULATION (Kundetype vs Tariftype):")
-    print(stats['cross_tab'])
+    Args:
+        input_file: Path to input CSV file
+        output_file: Output filename (default from config)
+        use_data_folder: If True, save to Data folder; if False, save to same dir as input
+    """
+    
+    
+    
+    # Map grid companies
+    grid_mapping = load_grid_mapping()
+    df = map_grid_codes(df, grid_mapping)
+    
+    # Categorize
+    print("Categorizing...")
+    df['ChargeType_Category'] = df['ChargeType'].apply(categorize_chargetype)
+    df['Kundetype'] = df.apply(lambda row: find_category(row, kundetype_patterns,kundetype_priority), axis=1)
+    df['Tariftype'] = df.apply(lambda row: find_category(row, tariftype_patterns,tariftype_priority), axis=1)
+    
+    # Reorder columns
+    priority_cols = [col for col in OUTPUT_COLUMN_ORDER if col in df.columns]
+    other_cols = [col for col in df.columns if col not in priority_cols]
+    df = df[priority_cols + other_cols]
+    
+    # Statistics
+    print(f"\nResults:")
+    print(f"  Kundetype: {df['Kundetype'].value_counts().to_dict()}")
+    print(f"  Tariftype: {df['Tariftype'].value_counts().to_dict()}")
+    
+
+    return df
+
+# ============================================
+# MAIN EXECUTION
+# ============================================
 
 def main():
-    """Main execution function"""
-    # Set up file paths using the Data directory structure
-    script_dir = get_script_directory()
+    """Standalone execution"""
     data_dir = get_data_directory()
-    
-    # Input file path - adjust this to your actual file location
     input_file = os.path.join(data_dir, 'Tarif_data_2021_2024.csv')
     
-    # Alternative: if file is in same directory as script
-    # input_file = os.path.join(script_dir, 'Tarif_data_2021_2024.csv')
-    
     if not os.path.exists(input_file):
-        print(f"Input file not found: {input_file}")
-        print("Please ensure the CSV file is in the correct location.")
+        print(f"❌ Input file not found: {input_file}")
         return
     
-    # Run the categorization
-    result = enhanced_categorize_tariff_data(
-        file_path=input_file,
-        output_filename='tariff_categorization_results.xlsx',
-        use_data_folder=True
-    )
+    df,output_path = load_raw_tarif_data(
+        input_file=input_file,
+        output_file=DEFAULT_OUTPUT_FILENAME,
+        use_data_folder=True)
     
-    if 'error' not in result:
-        print(f"\n✅ Categorization completed successfully!")
-        print(f"📊 Results saved to: {result['output_path']}")
-        
-        # Quick summary
-        df = result['df']
-        print(f"\n📈 Quick Summary:")
-        print(f"   Total rows: {len(df)}")
-        print(f"   Kundetype categories: {df['Kundetype'].nunique()}")
-        print(f"   Tariftype categories: {df['Tariftype'].nunique()}")
-        print(f"   Uncategorized (both): {len(df[(df['Kundetype'] == 'Uncategorized') & (df['Tariftype'] == 'Uncategorized')])}")
-        
-    else:
-        print(f"❌ Error occurred: {result['error']}")
+    df = categorize_tariff_data(df)
+
+    # Save
+    print(f"\nSaving to: {output_path}")
+    df.to_excel(output_path, sheet_name='Categorized Data', index=False)
+    
+    print("✅ Done!")
 
 if __name__ == "__main__":
     main()
