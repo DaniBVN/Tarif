@@ -271,20 +271,66 @@ def load_raw_tarif_data(input_file, output_file=None, use_data_folder=True):
     df['ValidFrom'] = pd.to_datetime(df['ValidFrom'], errors='coerce')
     df['ValidTo'] = pd.to_datetime(df['ValidTo'], errors='coerce')
     
-    # Remove duplicates and aggregate date ranges
-    # Group by all columns except valid_from and valid_to
+    # Sort by valid_from to ensure chronological order
+    df = df.sort_values('ValidFrom').reset_index(drop=True)
+    
+    # Identify all columns
     date_cols = ['ValidFrom', 'ValidTo']
-    group_cols = [col for col in df.columns if col not in date_cols]
+    price_cols = [col for col in df.columns if col.lower().startswith('price')]
     
-    # Group and aggregate dates
-    df2 = df.groupby(group_cols, dropna=False).agg({
-        'ValidFrom': 'min',
-        'ValidTo': 'max'
-    }).reset_index()
+    # Non-price, non-date columns (these define the groups)
+    id_cols = [col for col in df.columns if col not in date_cols and col not in price_cols]
     
-    print(f"After deduplication: {len(df)} rows")
+    # Group by ID columns only (not prices)
+    grouped = df.groupby(id_cols, dropna=False)
+    
+    result_rows = []
+    
+    # Process each group
+    for group_keys, group_df in grouped:
+        group_df = group_df.sort_values('ValidFrom').reset_index(drop=True)
+        
+        i = 0
+        while i < len(group_df):
+            # Start a new period
+            current_row = group_df.iloc[i].copy()
+            current_prices = current_row[price_cols].values
+            period_start = current_row['ValidFrom']
+            period_end = current_row['ValidTo']
+            
+            # Look ahead to find consecutive rows with same prices
+            j = i + 1
+            while j < len(group_df):
+                next_row = group_df.iloc[j]
+                next_prices = next_row[price_cols].values
+                
+                # Check if all prices are the same
+                if all(current_prices == next_prices):
+                    # Extend the period
+                    period_end = max(period_end, next_row['ValidTo'])
+                    j += 1
+                else:
+                    # Prices changed, stop extending
+                    break
+            
+            # Create result row with extended date range
+            result_row = current_row.copy()
+            result_row['ValidFrom'] = period_start
+            result_row['ValidTo'] = period_end
+            result_rows.append(result_row)
+            
+            # Move to next distinct price period
+            i = j
+    
+    # Create result dataframe
+    df_result = pd.DataFrame(result_rows)
+    
+    # Restore original column order
+    df_result = df_result[df.columns]
+    
+    print(f"After deduplication: {len(df_result)} rows (was {len(df)} rows)")
 
-    return df2,output_path
+    return df_result,output_path
 
 def categorize_tariff_data(df):
     """
@@ -318,7 +364,6 @@ def categorize_tariff_data(df):
     print(f"  Kundetype: {df['Kundetype'].value_counts().to_dict()}")
     print(f"  Tariftype: {df['Tariftype'].value_counts().to_dict()}")
     
-
     return df
 
 # ============================================

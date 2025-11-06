@@ -6,7 +6,7 @@ Categorization Pattern Configuration
 kundetype_patterns = {
     'Ahøj+': {
         'Note': ['a høj plus', 'Nettarif A0','1.000.000 kWh', ' A0'],
-        'Description': ['132-150 kV'],
+        'Description': ['132-150 kV', '1.000.000KWH','1.000.000 kWh'],
         'ChargeTypeCode': []
     },
     'Ahøj': {
@@ -32,8 +32,8 @@ kundetype_patterns = {
         'ChargeTypeCode': ['e-54', 'e-67', 'e-71', 'e-81']
     },
     'C': {
-        'Note': ['net abo c', 'nettarif c', 'type c', ' c ', ' c', 'kunde c', 'kategori c'],
-        'Description': ['0,4 kv-nettet', '0.4 kv', '0,4 kv', 'årsaflæst måler', ' 0,4 ', ' 0.4 '],
+        'Note': ['net abo c', 'nettarif c', 'type c', ' c ', 'kunde c', 'kategori c','C-Kunde'],
+        'Description': ['0,4 kv-nettet', '0.4 kv', '0,4 kv', 'årsaflæst måler', ' 0,4 ', ' 0.4 ','C-Kunde'],
         'ChargeTypeCode': ['e-50', 'e-51', 'e-66', 'e-70', 'e-80', 'e-85']
     }
 }
@@ -67,8 +67,30 @@ tariftype_patterns = {
     'effektbetaling': {
         'ChargeType': ['D01'],
         'ChargeTypeCode': [],
-        'Note': ['effektbetaling', 'effekt'],
+        'Note': ['effektbetaling', 'effekt', 'effektbidrag'],
         'Description': ['capacity charge', 'demand charge','effektbetaling','Effektbidrag']
+    }
+}
+
+# NEEDS TO BE IMPLEMENTED!!!
+# afregning patterns
+afregning_patterns = {
+    'E01': { # Skabelonafregnet
+        'ChargeType': ['D03'],
+        'Note': [],
+        'Description': ['årsaflæst']
+    },
+    'E02': { # Timeafregnet
+        'ChargeType': ['D03'],
+        'ChargeTypeCode': [],
+        'Note': [' time'],
+        'Description': [' timeaflæst ']
+    },
+    'D01': { # Fleksafregnet
+        'ChargeType': ['D03'],  # Changed from D01 to D03
+        'ChargeTypeCode': [],
+        'Note': [' flex'],
+        'Description': [' flex', 'timeaflæst']
     }
 }
 
@@ -96,4 +118,4 @@ OUTPUT_COLUMN_ORDER = [
 ]
 
 GRID_MAPPING_FILENAME = 'Netselskabs_koder.xlsx'
-DEFAULT_OUTPUT_FILENAME = 'tariff_categorization_results.xlsx'
+DEFAULT_OUTPUT_FILENAME = 'tariff_categorization_results3.xlsx'
