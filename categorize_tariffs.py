@@ -1,17 +1,23 @@
 import pandas as pd
 import polars as pl
 import os
+import numpy as np
 
 # Import configuration
 from categorization_config import (
     kundetype_patterns,
-    tariftype_patterns,
-    chargetype_mapping,
+    pris_element_patterns,
+    bruger_patterns,
+    net_patterns,
+    Rabat_patterns,
     kundetype_priority,
-    tariftype_priority,
+    pris_element_priority,
+    bruger_priority,
+    net_priority,
+    Rabat_priority,
     OUTPUT_COLUMN_ORDER,
-    GRID_MAPPING_FILENAME,
-    DEFAULT_OUTPUT_FILENAME
+    DEFAULT_OUTPUT_FILENAME,
+    use_temp_file
 )
 
 # ============================================
@@ -24,255 +30,145 @@ def get_data_directory():
     return os.path.join(os.path.dirname(script_dir), 'Data')
 
 # ============================================
-# GRID COMPANY MAPPING
-# ============================================
-
-def load_grid_mapping():
-    """Load grid company mapping file"""
-    data_dir = get_data_directory()
-    mapping_file = os.path.join(data_dir, GRID_MAPPING_FILENAME)
-    
-    if not os.path.exists(mapping_file):
-        print(f"⚠️  Grid mapping file not found: {GRID_MAPPING_FILENAME}")
-        return None
-    
-    df_mapping = pd.read_excel(mapping_file)
-    mapping = {}
-    for _, row in df_mapping.iterrows():
-        company_name = str(row['GRID_COMPANY_NAME']).strip()
-        if company_name not in mapping:
-            mapping[company_name] = {
-                'MPO_GRID_AREA_CODE': row['MPO_GRID_AREA_CODE'],
-                'PriceArea': row['PriceArea']
-            }
-    print(f"✅ Loaded {len(mapping)} grid companies")
-    return mapping
-
-def map_grid_codes(df, grid_mapping):
-    """Map ChargeOwner to MPO_GRID_AREA_CODE and PriceArea"""
-    if grid_mapping is None or 'ChargeOwner' not in df.columns:
-        return df
-    
-    df['MPO_GRID_AREA_CODE'] = None
-    df['PriceArea'] = None
-    
-    for idx, row in df.iterrows():
-        if pd.notna(row.get('ChargeOwner')):
-            owner = str(row['ChargeOwner']).strip()
-            if owner in grid_mapping:
-                df.at[idx, 'MPO_GRID_AREA_CODE'] = grid_mapping[owner]['MPO_GRID_AREA_CODE']
-                df.at[idx, 'PriceArea'] = grid_mapping[owner]['PriceArea']
-    
-    return df
-
-# ============================================
 # CATEGORIZATION FUNCTIONS
 # ============================================
 
-def categorize_chargetype(charge_type):
-    """Map D01/D02/D03 to category"""
-    if pd.notna(charge_type):
-        return chargetype_mapping.get(str(charge_type).strip().upper(), 'Unknown')
-    return 'Unknown'
-
-def find_category2(row, category_patterns):
+def find_category(row, category_patterns, COLUMN_PRIORITY_ORDER,fallback):
     """
-    Find which category a row belongs to using cascading filter approach.
-    
-    Algorithm:
-    1. Start with all possible categories
-    2. Check ChargeType - keep only categories that match (or have no patterns)
-    3. If multiple remain, check ChargeTypeCode - narrow down further
-    4. If multiple remain, check Note - narrow down further
-    5. If multiple remain, check Description - narrow down further
-    6. If exactly one category remains, return it. Otherwise "Uncategorized"
-    
-    Args:
-        row: DataFrame row to categorize
-        category_patterns: Dictionary with structure {category: {column: [patterns]}}
-    
-    Returns:
-        Category name or "Uncategorized"
-    """
-    # Get column priority order from config
-    column_priority = COLUMN_PRIORITY_ORDER
-    
-    # Start with all categories as candidates
-    candidate_categories = list(category_patterns.keys())
-    
-    # Process each column in priority order
-    for column in column_priority:
-        # Skip if column doesn't exist in row or is empty
-        if column not in row or pd.notna(row[column]) is False:
-            continue
-        
-        text_lower = str(row[column]).lower()
-        
-        # Find which candidates match at this priority level
-        matching_categories = []
-        categories_with_patterns = []
-        
-        for category in candidate_categories:
-            # Check if this category has patterns for this column
-            if column not in category_patterns[category]:
-                continue
-            
-            patterns = category_patterns[category][column]
-            
-            # If category has no patterns for this column, keep it as candidate
-            if not patterns:
-                continue
-            
-            # This category has patterns for this column
-            categories_with_patterns.append(category)
-            
-            # Check if any pattern matches
-            for pattern in patterns:
-                if pattern.lower() in text_lower:
-                    matching_categories.append(category)
-                    break  # Found a match, no need to check other patterns
-        
-        # If some categories had patterns for this column, filter based on matches
-        if categories_with_patterns:
-            if matching_categories:
-                # Narrow down to only matching categories
-                candidate_categories = matching_categories
-            else:
-                # No matches found, but some had patterns - these are eliminated
-                # Keep only categories that didn't have patterns for this column
-                candidate_categories = [c for c in candidate_categories if c not in categories_with_patterns]
-        
-        # If we're down to one candidate, we're done
-        if len(candidate_categories) == 1:
-            return candidate_categories[0]
-        
-        # If we're down to zero candidates, return uncategorized
-        if len(candidate_categories) == 0:
-            return "Uncategorized"
-    
-    # After checking all columns:
-    # - If exactly one category remains, return it
-    # - If multiple remain, it's ambiguous -> Uncategorized
-    # - If none remain, return Uncategorized
-    if len(candidate_categories) == 1:
-        return candidate_categories[0]
-    else:
-        return "Uncategorized"
-
-def find_category(row, category_patterns,COLUMN_PRIORITY_ORDER):
-    """
-    Cascading filter: Start with all categories, narrow down at each priority level.
+    Cascading filter with match counting: Categories compete based on number of pattern matches.
     
     Rules:
     1. If column is empty/missing in data → skip to next column (don't check patterns)
     2. If column has data AND category has empty pattern list [] → category abstains (stays)
     3. If column has data AND category has patterns:
-       - Pattern matches → keep category
+       - Pattern matches → keep category and increment match count
        - Pattern doesn't match → eliminate category
+    4. Winner is determined by highest match count
     
     Args:
         row: DataFrame row to categorize
         category_patterns: {category: {column: [patterns]}}
+        COLUMN_PRIORITY_ORDER: List of columns to check in order
     
     Returns:
-        Category name or "Uncategorized"
+        Category name or string of matching patterns
     """
+
     candidates = list(category_patterns.keys())
-    #print()
-    #print(row[COLUMN_PRIORITY_ORDER])
-    #print(candidates)
-    #print(COLUMN_PRIORITY_ORDER)
+    match_counts = {cat: 0 for cat in candidates}  # Track matches per category
+    matching_patterns = []
+    
     for c, column in enumerate(COLUMN_PRIORITY_ORDER):
+
         # Skip if column doesn't exist, is NaN, or is empty string
         if column not in row or pd.isna(row[column]) or str(row[column]).strip() == '':
             continue
         
         text = str(row[column]).lower()
-        new_candidates = []
+        update_candidates = []
         
+        # Loops through all candidates
+        candidate_matches = False # If there are no candidates matches then do not update the candidates
         for category in candidates:
 
             # Get patterns for this category and column
             if column not in category_patterns[category]:
-                new_candidates.append(category)
+                update_candidates.append(category)
                 continue
             
             patterns = category_patterns[category][column]
             
             if not patterns:  # Empty list [] - category abstains
-                new_candidates.append(category)
+                update_candidates.append(category)
                 continue
             
-            # Category has patterns - check if any match
+            # Category has patterns - check ALL matches and count them
+            has_match = False
             for pattern in patterns:
                 if pattern.lower() in text:
-                    new_candidates.append(category)
-                    break
-        # After
-        #if len(new_candidates) == 1:
-         #   break
-
-        candidates = new_candidates
+                    match_counts[category] += 1
+                    matching_patterns.append(pattern.lower())
+                    has_match = True
+                    
+                    # DON'T break - count all matches
+            
+            # Only keep category if it had at least one match
+            if has_match:
+                update_candidates.append(category)
+                candidate_matches = True # 
         
-        # Early termination
-        if len(candidates) == 0:
-            type = "Uncategorized"
-            #print(type)
-            return type
-        if len(candidates) == 1:
-            type = candidates[0]
-            #print(type)
-            return type
         
+        # Select only the candidates which were there from the column
+        if candidate_matches: # Only if there are matches you should do
+            candidates = update_candidates
+        
+        
+        # If there is only one candidate and there was a match, terminate early
+        if len(candidates) == 1 and candidate_matches:
+            return candidates[0]
+    
 
-    c = len(COLUMN_PRIORITY_ORDER)
-    # After all columns
-    if len(candidates) == 0:
-        type = "Uncategorized"
-        #print(type)
-        return type
-    if len(candidates) == 1:
-        type = candidates[0]
-        #print(type)
-        return type
+    # If there have been no matches, then go to fallback or say that there are no matches
+    if len(matching_patterns) == 0: 
+        if fallback == None:
+            return "Uncategorized - No matches"
+        else:
+            return fallback
+            
+
+    # If there is just one candidate
+    elif len(candidates) == 1:
+        return candidates[0]
+    
+    # If there are multiple candidates - select the one with most matches
+    else:
+        # Get match counts only for remaining candidates
+        candidate_counts = {cat: match_counts[cat] for cat in candidates}
+        
+        # Find max count
+        max_count = max(candidate_counts.values())
+        
+        # Get all categories with max count
+        winners = [cat for cat, count in candidate_counts.items() if count == max_count]
+        
+        if len(winners) == 1:
+            return winners[0]
+        else:
+            if matching_patterns:
+                # Tie between multiple categories
+                return f"Uncategorized - Tie between: {', '.join(winners)} (Matches: {', '.join(matching_patterns)})"
+            else:
+                return "Uncategorized - No matches"
 
 # ============================================
 # MAIN FUNCTION
 # ============================================
 
-def load_raw_tarif_data(input_file, output_file=None, use_data_folder=True):
+def load_raw_tarif_data(input_file, output_dir):
     """
     Main categorization function
 
     Args:
-        input_file: Path to input CSV file
-        output_file: Output filename (default from config)
-        use_data_folder: If True, save to Data folder; if False, save to same dir as input
+        input_file: Path to input Parquet file
+        output_dir: Output directory (default from config)
     """
-
-    # Determine output directory
-    if use_data_folder:
-        output_dir = get_data_directory()
-        os.makedirs(output_dir, exist_ok=True)
-    else:
-        output_dir = os.path.dirname(input_file)
-
-    if output_file is None:
-        output_file = DEFAULT_OUTPUT_FILENAME
-
-    output_path = os.path.join(output_dir, output_file)
 
     # Read data
     print(f"Reading: {input_file}")
-    df = pd.read_csv(input_file, encoding='utf-8')
+    df = pl.read_parquet(input_file)
     print(f"Loaded {len(df)} rows")
     
-    # Convert date columns to datetime
-    df['ValidFrom'] = pd.to_datetime(df['ValidFrom'], errors='coerce')
-    df['ValidTo'] = pd.to_datetime(df['ValidTo'], errors='coerce')
+    # Convert date columns to datetime and format them immediately
+    df = df.with_columns([
+        pl.col("ValidFrom").str.strptime(pl.Datetime, "%Y-%m-%dT%H:%M:%S%.f").dt.strftime("%Y-%m-%d %H:%M:%S").alias("ValidFrom"),
+        pl.when(pl.col("ValidTo").is_not_null())
+        .then((pl.col("ValidTo").str.strptime(pl.Datetime, "%Y-%m-%dT%H:%M:%S%.f") - pl.duration(hours=1)).dt.strftime("%Y-%m-%d %H:%M:%S"))
+        .otherwise(pl.col("ValidTo"))
+        .alias("ValidTo")
+    ])
     
-    # Sort by valid_from to ensure chronological order
-    df = df.sort_values('ValidFrom').reset_index(drop=True)
+    # Sort by ValidFrom to ensure chronological order
+    df = df.sort("ValidFrom")
     
     # Identify all columns
     date_cols = ['ValidFrom', 'ValidTo']
@@ -281,33 +177,31 @@ def load_raw_tarif_data(input_file, output_file=None, use_data_folder=True):
     # Non-price, non-date columns (these define the groups)
     id_cols = [col for col in df.columns if col not in date_cols and col not in price_cols]
     
-    # Group by ID columns only (not prices)
-    grouped = df.groupby(id_cols, dropna=False)
-    
+    # Group by ID columns and process
     result_rows = []
     
-    # Process each group
-    for group_keys, group_df in grouped:
-        group_df = group_df.sort_values('ValidFrom').reset_index(drop=True)
+    for group_keys, group_df in df.group_by(id_cols, maintain_order=True):
+        group_df = group_df.sort("ValidFrom")
+        group_data = group_df.to_dicts()
         
         i = 0
-        while i < len(group_df):
+        while i < len(group_data):
             # Start a new period
-            current_row = group_df.iloc[i].copy()
-            current_prices = current_row[price_cols].values
+            current_row = group_data[i].copy()
+            current_prices = [current_row[col] for col in price_cols]
             period_start = current_row['ValidFrom']
             period_end = current_row['ValidTo']
             
             # Look ahead to find consecutive rows with same prices
             j = i + 1
-            while j < len(group_df):
-                next_row = group_df.iloc[j]
-                next_prices = next_row[price_cols].values
+            while j < len(group_data):
+                next_row = group_data[j]
+                next_prices = [next_row[col] for col in price_cols]
                 
                 # Check if all prices are the same
-                if all(current_prices == next_prices):
+                if current_prices == next_prices:
                     # Extend the period
-                    period_end = max(period_end, next_row['ValidTo'])
+                    period_end = max(period_end, next_row['ValidTo']) if next_row['ValidTo'] else period_end
                     j += 1
                 else:
                     # Prices changed, stop extending
@@ -323,14 +217,18 @@ def load_raw_tarif_data(input_file, output_file=None, use_data_folder=True):
             i = j
     
     # Create result dataframe
-    df_result = pd.DataFrame(result_rows)
+    df_result = pl.DataFrame(result_rows)
     
     # Restore original column order
-    df_result = df_result[df.columns]
-    
+    df_result = df_result.select(df.columns)
+
+    temp_path = os.path.join(output_dir, 'temp.csv')
+    df_result.write_csv(temp_path)
+
     print(f"After deduplication: {len(df_result)} rows (was {len(df)} rows)")
 
-    return df_result,output_path
+    return df_result
+
 
 def categorize_tariff_data(df):
     """
@@ -343,17 +241,14 @@ def categorize_tariff_data(df):
     """
     
     
-    
-    # Map grid companies
-    grid_mapping = load_grid_mapping()
-    df = map_grid_codes(df, grid_mapping)
-    
     # Categorize
     print("Categorizing...")
-    df['ChargeType_Category'] = df['ChargeType'].apply(categorize_chargetype)
-    df['Kundetype'] = df.apply(lambda row: find_category(row, kundetype_patterns,kundetype_priority), axis=1)
-    df['Tariftype'] = df.apply(lambda row: find_category(row, tariftype_patterns,tariftype_priority), axis=1)
-    
+    df['KundeType'] = df.apply(lambda row: find_category(row, kundetype_patterns,kundetype_priority,None), axis=1)
+    df['PrisElement'] = df.apply(lambda row: find_category(row, pris_element_patterns,pris_element_priority,None), axis=1)
+    df['OverliggendeNet'] = df.apply(lambda row: find_category(row, net_patterns,net_priority,"Eget net"), axis=1)
+    df['Rabat'] = df.apply(lambda row: find_category(row, Rabat_patterns,Rabat_priority,"Normal"), axis=1)
+    df['Bruger'] = df.apply(lambda row: find_category(row, bruger_patterns,bruger_priority,"Forbrug"), axis=1)
+
     # Reorder columns
     priority_cols = [col for col in OUTPUT_COLUMN_ORDER if col in df.columns]
     other_cols = [col for col in df.columns if col not in priority_cols]
@@ -361,10 +256,81 @@ def categorize_tariff_data(df):
     
     # Statistics
     print(f"\nResults:")
-    print(f"  Kundetype: {df['Kundetype'].value_counts().to_dict()}")
-    print(f"  Tariftype: {df['Tariftype'].value_counts().to_dict()}")
+    print(f"  KundeType: {df['KundeType'].value_counts().to_dict()}")
+    print(f"  PrisElement: {df['PrisElement'].value_counts().to_dict()}")
+    print(f"  OverliggendeNet: {df['OverliggendeNet'].value_counts().to_dict()}")  
+    print(f"  Rabat: {df['Rabat'].value_counts().to_dict()}")  
+    print(f"  Bruger: {df['Bruger'].value_counts().to_dict()}")
+    
     
     return df
+
+def merge_only_overlapping_periods(df_pl,COLUMNS,col_groupby):
+        """
+        Merge ONLY overlapping or consecutive periods with identical prices.
+        Does NOT bridge gaps - respects discontinuities in the data.
+        """
+        
+        #col_groupby = ['KundeType', 'PrisElement', 'ChargeOwner','Bruger']
+        price_cols = [f'Price{i}' for i in range(1, 25)]
+        
+        # Parse dates if needed (adjust format as needed)
+        df_pl = df_pl.with_columns([
+            pl.col('ValidFrom').str.strptime(pl.Datetime, "%Y-%m-%d %H:%M:%S"),
+            pl.col('ValidTo').str.strptime(pl.Datetime, "%Y-%m-%d %H:%M:%S")
+        ])
+        
+        # Sort: ValidFrom ascending, ValidTo descending
+        df_sorted = df_pl.sort(
+            col_groupby + price_cols + ['ValidFrom', 'ValidTo'],
+            descending=[False] * (len(col_groupby) + len(price_cols)) + [False, True]
+        )
+        
+        # Within each group (same prices and attributes), check if current period overlaps with previous
+        df_sorted = df_sorted.with_columns([
+            # Get previous row's ValidTo within the same price group
+            pl.col('ValidTo').shift(1).over(col_groupby + price_cols).alias('prev_ValidTo'),
+            pl.col('ValidFrom').alias('curr_ValidFrom')
+        ])
+        
+        # Mark start of NEW non-overlapping period:
+        # - First row in group (prev_ValidTo is null)
+        # - OR there's a gap (current start > previous end)
+        df_sorted = df_sorted.with_columns([
+            pl.when(
+                pl.col('prev_ValidTo').is_null() |  # First row
+                (pl.col('curr_ValidFrom') > pl.col('prev_ValidTo'))  # Gap exists
+            )
+            .then(1)
+            .otherwise(0)
+            .alias('is_new_period')
+        ])
+        
+        # Create period_id by cumulative sum - this groups consecutive overlapping rows
+        df_sorted = df_sorted.with_columns([
+            pl.col('is_new_period')
+            .cum_sum()
+            .over(col_groupby + price_cols)
+            .alias('period_id')
+        ])
+        
+        # Now aggregate by period_id - each period_id represents one merged group
+        result = (
+            df_sorted
+            .group_by(col_groupby + price_cols + ['period_id'])
+            .agg([
+                pl.col('ValidFrom').min().alias('ValidFrom'),  # Earliest start in this continuous period
+                pl.col('ValidTo').max().alias('ValidTo'),      # Latest end in this continuous period
+                pl.len().alias('merged_count')  # Optional: see how many rows were merged
+            ])
+            .drop('period_id')
+            .sort(col_groupby + ['ValidFrom'])
+        )
+
+        result = result.select(COLUMNS)
+        
+        return result
+
 
 # ============================================
 # MAIN EXECUTION
@@ -372,25 +338,90 @@ def categorize_tariff_data(df):
 
 def main():
     """Standalone execution"""
+
+    #row = pd.DataFrame({'Note':['Nettarif B lav produktion time'],'Description':['Tarif, egenproduktion (time)']})
+    #find_category(row.iloc[0], kundetype_patterns,kundetype_priority)
+
     data_dir = get_data_directory()
-    input_file = os.path.join(data_dir, 'Tarif_data_2021_2024.csv')
+    input_file = os.path.join(data_dir, 'Tarif_data_2021_Maj2025.parquet')
     
     if not os.path.exists(input_file):
         print(f"❌ Input file not found: {input_file}")
         return
     
-    df,output_path = load_raw_tarif_data(
-        input_file=input_file,
-        output_file=DEFAULT_OUTPUT_FILENAME,
-        use_data_folder=True)
     
+    use_data_folder=True
+
+    # Determine output directory
+    if use_data_folder:
+        output_dir = get_data_directory()
+        os.makedirs(output_dir, exist_ok=True)
+    else:
+        output_dir = os.path.dirname(input_file)
+
+    output_file=DEFAULT_OUTPUT_FILENAME
+    if output_file is None:
+        output_file = DEFAULT_OUTPUT_FILENAME
+
+    output_path = os.path.join(output_dir, output_file)
+
+    if use_temp_file:
+        temp_file_path = os.path.join(output_dir,'temp.csv')
+        df = pd.read_csv(temp_file_path)
+    else:
+        df = load_raw_tarif_data(
+            input_file=input_file,
+            output_dir=output_dir)
+    
+    df = df.to_pandas()
     df = categorize_tariff_data(df)
 
     # Save
     print(f"\nSaving to: {output_path}")
     df.to_excel(output_path, sheet_name='Categorized Data', index=False)
     
-    print("✅ Done!")
+    
+
+    ''' New processing, where costumers which have been categorized in Costumer and price element are then grouped such that there are no duplicates'''
+
+    # For each Kundetype, PrisElement, ChargeOwner, ValidFrom, ValidTo
+        # Remove duplicates
+    # Check if Price1 to Price24 are the same. If so remove the duplicate
+
+    df_pl = pl.from_pandas(df)
+    
+
+    COLUMNS = [
+    'KundeType',
+    'PrisElement',
+    'Bruger',
+    'ChargeOwner',
+    'OverliggendeNet',
+    'Rabat',
+    'ValidFrom',
+    'ValidTo',
+    'Price1','Price2','Price3','Price4','Price5',
+    'Price6','Price7','Price8','Price9','Price10',
+    'Price11','Price12','Price13','Price14','Price15',
+    'Price16','Price17','Price18','Price19','Price20',
+    'Price21','Price22','Price23','Price24'
+    ]
+
+    col_groupby = ['KundeType', 'PrisElement', 'ChargeOwner','OverliggendeNet','Rabat','Bruger']
+
+    # Use it
+    df_merged = merge_only_overlapping_periods(df_pl,COLUMNS,col_groupby)
+    print(f"Original rows: {len(df_pl)}")
+    print(f"After merging overlaps: {len(df_merged)}")
+
+    # Convert back to pandas if needed
+    df = df_merged.to_pandas()
+
+    print(df.head())
+    print(f"\nShape: {df.shape}")
+    output_path = os.path.join(output_dir, 'cleaned.xlsx')
+    df.to_excel(output_path, sheet_name='Data', index=False)
+
 
 if __name__ == "__main__":
     main()

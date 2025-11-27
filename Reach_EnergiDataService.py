@@ -56,7 +56,7 @@ def fetch_datahub_pricelist(
     params = {
         'start': start_date,
         'end': end_date,
-        'limit': 100000  # Increase limit to get more records
+        'limit': 1000000000  # Increase limit to get more records
     }
     
     try:

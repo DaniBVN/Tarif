@@ -7,21 +7,25 @@ if script_dir not in sys.path:
     sys.path.insert(0, script_dir)
 
 from Reach_EnergiDataService import fetch_datahub_pricelist
-from categorize_tariffs import categorize_tariff_data
-
+from categorize_tariffs import categorize_tariff_data,load_raw_tarif_data
+from categorization_config import (
+    DEFAULT_OUTPUT_FILENAME,
+)
 # ============================================================
 # CONFIGURATION - Change these settings as needed
 # ============================================================
 
 START_DATE = '2021-01-01'  # Start date (YYYY-MM-DD)
-END_DATE = '2024-12-31'    # End date (YYYY-MM-DD)
+END_DATE = '2025-07-01'    # End date (YYYY-MM-DD)
 USE_CACHED = True          # Set to False to force fresh download from API
 
-RAW_DATA_FILENAME = 'Tarif_data_2021_2024'           # Base filename for raw data
-OUTPUT_FILENAME = 'tariff_categorization_results5.xlsx'  # Final Excel output
+RAW_DATA_FILENAME = 'Tarif_data_2021_Juni2025'           # Base filename for raw data
+OUTPUT_FILENAME = 'tariff_categorization_results7.xlsx'  # Final Excel output
 
 # ============================================================
-
+output_file=DEFAULT_OUTPUT_FILENAME
+if output_file is None:
+    output_file = DEFAULT_OUTPUT_FILENAME
 
 def main():
     """
@@ -57,13 +61,20 @@ def main():
     print(f"\n[STEP 2/2] Categorizing tariff data...")
     print("-"*70)
     
-    csv_path = os.path.join(data_dir, f'{RAW_DATA_FILENAME}.csv')
+    input_file = os.path.join(data_dir, f'{RAW_DATA_FILENAME}.parquet')
+
     
-    result = categorize_tariff_data(
-        input_file=csv_path,
-        output_file=OUTPUT_FILENAME,
-        use_data_folder=True
-    )
+    df = load_raw_tarif_data(
+        input_file=input_file,
+        output_dir=data_dir)
+    
+    df = df.to_pandas()
+    df = categorize_tariff_data(df)
+    output_path = data_dir + output_file
+    # Save
+    print(f"\nSaving to: {data_dir}")
+    df.to_excel(output_path, sheet_name='Categorized Data', index=False)
+
     
 
 
